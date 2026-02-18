@@ -405,15 +405,9 @@ def render_simulator(raw: pd.DataFrame, rider: pd.DataFrame,
                                key="sim_hub")
 
         hub_mask = date_mask & (raw["ch_id"] == sel_hub)
-        hours = sorted(raw.loc[hub_mask, "order_hour_ist"].dropna().unique())
-        if not hours:
-            hours = [0.0]
-        min_h, max_h = int(hours[0]), int(hours[-1])
-        default_lo = max(min_h, min(10, max_h))
-        default_hi = min(max_h, max(default_lo, 12))
         hour_range = st.slider(
-            "Time Range (IST hours)", min_value=min_h, max_value=max_h,
-            value=(default_lo, default_hi), key="sim_hours",
+            "Time Range (IST hours)", min_value=6, max_value=23,
+            value=(10, 12), key="sim_hours",
         )
 
         st.divider()
