@@ -26,7 +26,6 @@ st.set_page_config(
 )
 
 SERVICE_TIME_PENALTY_MIN = 8
-BREACH_REDISTRIBUTION_EFF = 0.35
 EARTH_RADIUS_KM = 6371.0
 DEFAULT_DATA_PATH = Path(__file__).parent / "data" / "Batching Analysis.xlsx"
 
@@ -226,18 +225,20 @@ def compute_l1_l2(result: Dict, breach_count: float, breach_rate: float,
     net_time_saved = max(gross_time_saved - service_penalty, 0)
 
     avg_breach_delay = avg_breach_delay_est if breach_count > 0 else 0
-    effective_time = net_time_saved * BREACH_REDISTRIBUTION_EFF
-    if breach_count > 0 and effective_time > 0:
-        breaches_prevented = min(
-            int(breach_count),
-            int(effective_time / max(avg_breach_delay, 1)),
-        )
-    else:
-        breaches_prevented = 0
 
-    if breach_count > 0:
-        new_breach_rate = max(0, breach_rate * (1 - breaches_prevented / breach_count))
+    # Per-order time benefit model: batching saves net_time across all orders;
+    # each order's expected improvement = net_time / total_orders.
+    # A breach is recoverable only if per-order benefit covers enough of its delay.
+    # Denominator uses 2x avg delay to account for the distribution of breach
+    # severity (some breaches far exceed the average and are unrecoverable).
+    if total_orders > 0 and breach_count > 0 and avg_breach_delay > 0:
+        time_benefit_per_order = net_time_saved / total_orders
+        breach_recovery_fraction = min(1.0, time_benefit_per_order / (2 * avg_breach_delay))
+        breaches_prevented = breach_count * breach_recovery_fraction
+        new_breach_rate = max(0.0, breach_rate * (1 - breach_recovery_fraction))
     else:
+        breach_recovery_fraction = 0.0
+        breaches_prevented = 0.0
         new_breach_rate = breach_rate
 
     batching_pct = (batched / total_orders * 100) if total_orders else 0
@@ -257,7 +258,8 @@ def compute_l1_l2(result: Dict, breach_count: float, breach_rate: float,
             "gross_time_saved": gross_time_saved,
             "service_penalty": service_penalty,
             "net_time_saved": net_time_saved,
-            "effective_time": effective_time,
+            "time_benefit_per_order": net_time_saved / total_orders if total_orders else 0,
+            "breach_recovery_fraction": breach_recovery_fraction,
             "extra_stops": extra_stops,
             "avg_breach_delay": avg_breach_delay,
             "capped": result["capped"],
@@ -671,21 +673,22 @@ Trips reduced from {l1['actual_trips']} -> {l1['sim_trips']}, so each trip now s
 | Step | Calculation | Result |
 |---|---|---|
 | Trips eliminated | {l1['actual_trips']} - {l1['sim_trips']} | **{l1['trips_saved']}** |
-| Gross time saved | {l1['trips_saved']} x {inp['avg_o2r']:.1f} min | **{l2['gross_time_saved']:.0f} min** |
-| Service penalty | {l2['extra_stops']} extra stops x {SERVICE_TIME_PENALTY_MIN} min | **-{l2['service_penalty']:.0f} min** |
-| Net time saved | {l2['gross_time_saved']:.0f} - {l2['service_penalty']:.0f} | **{l2['net_time_saved']:.0f} min** |
-| Effective for breach (x{BREACH_REDISTRIBUTION_EFF:.0%}) | {l2['net_time_saved']:.0f} x {BREACH_REDISTRIBUTION_EFF} | **{l2['effective_time']:.0f} min** |
+| Gross time saved | {l1['trips_saved']} × {inp['avg_o2r']:.1f} min | **{l2['gross_time_saved']:.0f} min** |
+| Service penalty | {l2['extra_stops']} extra stops × {SERVICE_TIME_PENALTY_MIN} min | **−{l2['service_penalty']:.0f} min** |
+| Net time saved | {l2['gross_time_saved']:.0f} − {l2['service_penalty']:.0f} | **{l2['net_time_saved']:.0f} min** |
 
-**Breach recovery:**
-- Current breaches: **{int(l1['breach_count'])}** ({l1['actual_breach_rate']:.1f}%)
-- Avg breach delay: **{l2['avg_breach_delay']:.1f} min** (from per-order delay_minutes data)
-- Effective time available: **{l2['effective_time']:.0f} min** (35% redistribution efficiency — not all freed time reaches breached orders)
-- Recoverable: {l2['effective_time']:.0f} / {l2['avg_breach_delay']:.1f} = **{l1['breaches_prevented']}** breaches
-- New rate: {l1['actual_breach_rate']:.1f}% x (1 - {l1['breaches_prevented']}/{max(int(l1['breach_count']), 1)}) = **{l1['sim_breach_rate']:.1f}%**
+**Per-order breach recovery model:**
+- Time benefit per order: {l2['net_time_saved']:.0f} min / {inp['total_orders']} orders = **{l2['time_benefit_per_order']:.2f} min/order**
+- Avg breach delay: **{l2['avg_breach_delay']:.1f} min**
+- Recovery fraction: min(1.0, {l2['time_benefit_per_order']:.2f} / (2 × {l2['avg_breach_delay']:.1f})) = **{l2['breach_recovery_fraction']:.1%}**
+- Current breaches: **{l1['breach_count']:.0f}** ({l1['actual_breach_rate']:.1f}%)
+- Recoverable: {l1['breach_count']:.0f} × {l2['breach_recovery_fraction']:.1%} = **{l1['breaches_prevented']:.1f}** breaches
+- New rate: {l1['actual_breach_rate']:.1f}% × (1 − {l2['breach_recovery_fraction']:.1%}) = **{l1['sim_breach_rate']:.1f}%**
 
-**Why 35% redistribution?** Freed rider time is system-wide — only a fraction
-reaches the specific orders at risk of breaching. The 35% factor accounts for
-queue position, rider assignment, and geographic mismatch.
+**Why 2× avg delay in denominator?** Breach delays are distributed — some orders
+miss SLA by 1 min (easily recovered), others by 15+ min (unrecoverable with ~{l2['time_benefit_per_order']:.1f} min
+benefit). Using 2× avg_delay models this distribution: only the fraction of breaches
+where per-order savings exceed their specific delay are realistically preventable.
 """)
 
     with lc3:
