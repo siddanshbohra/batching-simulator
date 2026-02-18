@@ -25,7 +25,8 @@ st.set_page_config(
     page_icon="🚚",
 )
 
-SERVICE_TIME_PENALTY_MIN = 3
+SERVICE_TIME_PENALTY_MIN = 8
+BREACH_REDISTRIBUTION_EFF = 0.35
 EARTH_RADIUS_KM = 6371.0
 DEFAULT_DATA_PATH = Path(__file__).parent / "data" / "Batching Analysis.xlsx"
 
@@ -225,10 +226,11 @@ def compute_l1_l2(result: Dict, breach_count: float, breach_rate: float,
     net_time_saved = max(gross_time_saved - service_penalty, 0)
 
     avg_breach_delay = avg_breach_delay_est if breach_count > 0 else 0
-    if breach_count > 0 and net_time_saved > 0:
+    effective_time = net_time_saved * BREACH_REDISTRIBUTION_EFF
+    if breach_count > 0 and effective_time > 0:
         breaches_prevented = min(
             int(breach_count),
-            int(net_time_saved / max(avg_breach_delay, 1)),
+            int(effective_time / max(avg_breach_delay, 1)),
         )
     else:
         breaches_prevented = 0
@@ -255,6 +257,7 @@ def compute_l1_l2(result: Dict, breach_count: float, breach_rate: float,
             "gross_time_saved": gross_time_saved,
             "service_penalty": service_penalty,
             "net_time_saved": net_time_saved,
+            "effective_time": effective_time,
             "extra_stops": extra_stops,
             "avg_breach_delay": avg_breach_delay,
             "capped": result["capped"],
@@ -387,6 +390,7 @@ def render_simulator(raw: pd.DataFrame, rider: pd.DataFrame,
     st.caption("Uses actual delivery lat/lng from Orders Raw — zero synthetic data.")
     hub_names = wh.set_index("ch_id")["wh_name"].to_dict()
 
+    # ── Sidebar ──────────────────────────────────────────────────────────────
     with st.sidebar:
         st.header("⚙️ Simulation Parameters")
 
@@ -404,51 +408,69 @@ def render_simulator(raw: pd.DataFrame, rider: pd.DataFrame,
         hours = sorted(raw.loc[hub_mask, "order_hour_ist"].dropna().unique())
         if not hours:
             hours = [0.0]
-        sel_hour = st.select_slider("Hour (IST)", options=hours,
-                                    value=hours[len(hours) // 2], key="sim_hour")
+        min_h, max_h = int(hours[0]), int(hours[-1])
+        default_lo = max(min_h, min(10, max_h))
+        default_hi = min(max_h, max(default_lo, 12))
+        hour_range = st.slider(
+            "Time Range (IST hours)", min_value=min_h, max_value=max_h,
+            value=(default_lo, default_hi), key="sim_hours",
+        )
 
         st.divider()
         st.subheader("Batching Logic")
         R_km = st.slider("Batching Radius R (km)", 0.5, 5.0, 2.0, 0.25)
-        T_min = st.slider("Time Window T (min)", 5, 20, 10, 1)
+        T_min = st.slider("Time Window T (min)", 3, 20, 10, 1)
         S_max = st.slider("Max Batch Size S", 2, 5, 3, 1)
 
         st.divider()
         run_btn = st.button("🚀 Run Simulation", type="primary",
                             use_container_width=True)
 
-    sim_orders = raw.loc[hub_mask & (raw["order_hour_ist"] == sel_hour)].copy()
+    # ── Filter orders by time range ──────────────────────────────────────────
+    sim_orders = raw.loc[
+        hub_mask &
+        (raw["order_hour_ist"] >= hour_range[0]) &
+        (raw["order_hour_ist"] <= hour_range[1])
+    ].copy()
 
-    rider_row = rider[
+    # ── Aggregate rider data across selected hours ───────────────────────────
+    rider_rows = rider[
         (rider["shift_date_ist"].dt.date == sel_date) &
-        (rider["shift_hour_ist"] == sel_hour) &
+        (rider["shift_hour_ist"] >= hour_range[0]) &
+        (rider["shift_hour_ist"] <= hour_range[1]) &
         (rider["ch_id"] == sel_hub)
     ]
-    active_riders = float(rider_row["active_riders"].iloc[0]) if not rider_row.empty else 0
-    avail_riders = float(rider_row["available_riders"].iloc[0]) if not rider_row.empty else 0
+    avg_active = float(rider_rows["active_riders"].mean()) if not rider_rows.empty else 0
+    avg_avail = float(rider_rows["available_riders"].mean()) if not rider_rows.empty else 0
+    n_hours = hour_range[1] - hour_range[0] + 1
+    rider_cap = avg_avail * n_hours
 
-    breach_row = breach[
+    # ── Aggregate breach data across selected hours ──────────────────────────
+    breach_rows = breach[
         (breach["order_date_ist"].dt.date == sel_date) &
-        (breach["order_hour_ist"] == sel_hour) &
+        (breach["order_hour_ist"] >= hour_range[0]) &
+        (breach["order_hour_ist"] <= hour_range[1]) &
         (breach["ch_id"] == sel_hub)
     ]
-    breach_count = float(breach_row["breach_count"].iloc[0]) if not breach_row.empty else 0
-    breach_rate = float(breach_row["breach_rate_pct"].iloc[0]) if not breach_row.empty else 0
-    avg_promise = float(breach_row["avg_promise_minutes"].iloc[0]) if not breach_row.empty else 15
-    avg_o2r = float(breach_row["o2r_avg"].iloc[0]) if (
-        not breach_row.empty and "o2r_avg" in breach_row.columns and
-        pd.notna(breach_row["o2r_avg"].iloc[0])
-    ) else 12.0
+    total_breach_sheet_orders = float(breach_rows["order_count"].sum()) if not breach_rows.empty else 0
+    breach_count = float(breach_rows["breach_count"].sum()) if not breach_rows.empty else 0
+    breach_rate = (breach_count / total_breach_sheet_orders * 100) if total_breach_sheet_orders > 0 else 0
+    avg_promise = float(breach_rows["avg_promise_minutes"].mean()) if not breach_rows.empty else 15
+
+    o2r_vals = breach_rows["o2r_avg"].dropna() if not breach_rows.empty else pd.Series(dtype=float)
+    avg_o2r = float(o2r_vals.mean()) if len(o2r_vals) > 0 else 12.0
 
     if avg_o2r == 12.0 and "actual_wh_to_cust_min" in sim_orders.columns:
         order_o2r = sim_orders["actual_wh_to_cust_min"].dropna()
         if not order_o2r.empty:
             avg_o2r = float(order_o2r.mean())
 
+    # ── Context Cards ────────────────────────────────────────────────────────
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Orders", len(sim_orders))
-    m2.metric("Active Riders", f"{int(active_riders)}" if active_riders else "—")
-    m3.metric("Available Riders", f"{int(avail_riders)}" if avail_riders else "—")
+    m2.metric("Avg Available Riders/hr", f"{avg_avail:.0f}" if avg_avail else "—")
+    m3.metric("Rider Cap (range)", f"{rider_cap:.0f}" if rider_cap else "—",
+              help=f"Avg available ({avg_avail:.0f}) x {n_hours} hours")
     m4.metric("Breach Rate", f"{breach_rate:.1f}%")
     m5.metric("Avg O2R", f"{avg_o2r:.1f} min")
 
@@ -457,7 +479,7 @@ def render_simulator(raw: pd.DataFrame, rider: pd.DataFrame,
         return
 
     if sim_orders.empty:
-        st.warning("No orders with delivery coordinates for this Date / Hub / Hour.")
+        st.warning("No orders with delivery coordinates for this Date / Hub / Time Range.")
         return
 
     total_n = len(sim_orders)
@@ -511,7 +533,7 @@ Each order has **actual** `delivery_lat` / `delivery_lng` from the logistics sys
 No coordinates are generated or estimated.
 
 - Hub: **{hub_names.get(sel_hub, sel_hub)}** ({sel_hub})
-- Date: **{sel_date}**, Hour: **{int(sel_hour)}:00 IST**
+- Date: **{sel_date}**, Time range: **{hour_range[0]}:00 – {hour_range[1]}:59 IST**
 - Orders with valid coordinates: **{total_n}**
 - Also available per order: `pickup_to_delivery_distance_km`, `distance_bucket`, `promise_time_min`
 """)
@@ -521,7 +543,7 @@ No coordinates are generated or estimated.
     # ══════════════════════════════════════════════════════════════════════════
 
     with st.spinner("Computing Haversine distance matrix & batching…"):
-        result = run_batching(sim_orders, R_km, T_min, S_max, active_riders)
+        result = run_batching(sim_orders, R_km, T_min, S_max, rider_cap)
 
     st.divider()
     st.subheader("Step 2 — Greedy Proximity Batching")
@@ -565,7 +587,7 @@ No coordinates are generated or estimated.
 3. Repeat until all orders are assigned.
 
 **Result:** {result['batch_trips']} multi-order batches ({result['batched_count']} orders) + {result['single_trips']} singles = **{result['total_trips']} trips**
-{'⚠️ **Rider cap applied:** Capped at ' + str(int(active_riders)) + ' active riders.' if result['capped'] else ''}
+{'⚠️ **Rider cap applied:** Capped at ' + str(int(rider_cap)) + ' available riders (' + str(int(avg_avail)) + '/hr x ' + str(n_hours) + ' hrs).' if result['capped'] else ''}
 """)
 
     if result["batches"]:
@@ -657,17 +679,19 @@ Trips reduced from {l1['actual_trips']} -> {l1['sim_trips']}, so each trip now s
 | Trips eliminated | {l1['actual_trips']} - {l1['sim_trips']} | **{l1['trips_saved']}** |
 | Gross time saved | {l1['trips_saved']} x {inp['avg_o2r']:.1f} min | **{l2['gross_time_saved']:.0f} min** |
 | Service penalty | {l2['extra_stops']} extra stops x {SERVICE_TIME_PENALTY_MIN} min | **-{l2['service_penalty']:.0f} min** |
-| **Net time saved** | {l2['gross_time_saved']:.0f} - {l2['service_penalty']:.0f} | **{l2['net_time_saved']:.0f} min** |
+| Net time saved | {l2['gross_time_saved']:.0f} - {l2['service_penalty']:.0f} | **{l2['net_time_saved']:.0f} min** |
+| Effective for breach (x{BREACH_REDISTRIBUTION_EFF:.0%}) | {l2['net_time_saved']:.0f} x {BREACH_REDISTRIBUTION_EFF} | **{l2['effective_time']:.0f} min** |
 
 **Breach recovery:**
 - Current breaches: **{int(l1['breach_count'])}** ({l1['actual_breach_rate']:.1f}%)
-- Avg breach delay: **{l2['avg_breach_delay']:.1f} min** (from per-order delay_minutes data; weighted by actual lateness of breached orders)
-- Recoverable: {l2['net_time_saved']:.0f} / {l2['avg_breach_delay']:.1f} = **{l1['breaches_prevented']}** breaches
-- New rate: {l1['actual_breach_rate']:.1f}% x (1 - {l1['breaches_prevented']}/{int(l1['breach_count'])}) = **{l1['sim_breach_rate']:.1f}%**
+- Avg breach delay: **{l2['avg_breach_delay']:.1f} min** (from per-order delay_minutes data)
+- Effective time available: **{l2['effective_time']:.0f} min** (35% redistribution efficiency — not all freed time reaches breached orders)
+- Recoverable: {l2['effective_time']:.0f} / {l2['avg_breach_delay']:.1f} = **{l1['breaches_prevented']}** breaches
+- New rate: {l1['actual_breach_rate']:.1f}% x (1 - {l1['breaches_prevented']}/{max(int(l1['breach_count']), 1)}) = **{l1['sim_breach_rate']:.1f}%**
 
-**3-min service penalty explained:** Each additional stop in a batch adds ~3 min
-for parking, navigation to door, OTP verification, and handoff. Without this,
-breach reduction would be over-estimated.
+**Why 35% redistribution?** Freed rider time is system-wide — only a fraction
+reaches the specific orders at risk of breaching. The 35% factor accounts for
+queue position, rider assignment, and geographic mismatch.
 """)
 
     with lc3:
@@ -689,7 +713,7 @@ breach reduction would be over-estimated.
 **Operational impact:**
 - {l1['trip_reduction_pct']:.1f}% fewer rider dispatches
 - Rider-minutes freed: {l1['trips_saved']} x {inp['avg_o2r']:.0f} = **{l1['trips_saved'] * inp['avg_o2r']:.0f} min** ({l1['trips_saved'] * inp['avg_o2r'] / 60:.1f} hrs)
-{'- Rider ceiling applied at ' + str(int(active_riders)) if result['capped'] else ''}
+{'- Rider ceiling applied: ' + str(int(rider_cap)) + ' available riders (' + str(int(avg_avail)) + '/hr x ' + str(n_hours) + ' hrs)' if result['capped'] else ''}
 """)
 
     st.divider()
@@ -721,9 +745,8 @@ This is determined by the actual Haversine distance matrix:
 2. Penalty = {l2['extra_stops']} extra stops x {SERVICE_TIME_PENALTY_MIN} min = **{l2['service_penalty']:.0f} min**
 3. Net = {l2['gross_time_saved']:.0f} - {l2['service_penalty']:.0f} = **{l2['net_time_saved']:.0f} min**
 
-**Why service penalty matters:**
-Without it, we'd overcount savings by {l2['service_penalty']:.0f} min. The 3-min-per-stop overhead
-covers: multi-drop navigation, customer OTP, doorstep wait — observed empirically in dark-store ops.
+**{SERVICE_TIME_PENALTY_MIN}-min service penalty:** Each additional stop in a batch adds ~{SERVICE_TIME_PENALTY_MIN} min
+for parking, navigation to door, OTP verification, and handoff.
 """)
 
     st.divider()
@@ -739,7 +762,7 @@ covers: multi-drop navigation, customer OTP, doorstep wait — observed empirica
         st.markdown("**Batching % vs Radius**")
         data_r = []
         for r in np.arange(0.5, 5.25, 0.5):
-            res = run_batching(sim_orders, r, T_min, S_max, active_riders)
+            res = run_batching(sim_orders, r, T_min, S_max, rider_cap)
             pct = res["batched_count"] / total_n * 100 if total_n else 0
             data_r.append({"Radius (km)": r, "Batching %": pct,
                            "Trips": res["total_trips"]})
@@ -754,8 +777,8 @@ covers: multi-drop navigation, customer OTP, doorstep wait — observed empirica
     with sc2:
         st.markdown("**Batching % vs Time Window**")
         data_t = []
-        for t in range(5, 21):
-            res = run_batching(sim_orders, R_km, t, S_max, active_riders)
+        for t in range(3, 21):
+            res = run_batching(sim_orders, R_km, t, S_max, rider_cap)
             pct = res["batched_count"] / total_n * 100 if total_n else 0
             data_t.append({"Window (min)": t, "Batching %": pct})
         df_t = pd.DataFrame(data_t)
@@ -770,7 +793,7 @@ covers: multi-drop navigation, customer OTP, doorstep wait — observed empirica
         st.markdown("**Trips vs Batch Size**")
         data_s = []
         for s in range(2, 6):
-            res = run_batching(sim_orders, R_km, T_min, s, active_riders)
+            res = run_batching(sim_orders, R_km, T_min, s, rider_cap)
             data_s.append({"Max Batch Size": s, "Trips": res["total_trips"],
                            "Batching %": res["batched_count"] / total_n * 100 if total_n else 0})
         df_s = pd.DataFrame(data_s)
